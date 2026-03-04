@@ -2,8 +2,6 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
 export default defineConfig({
-  base: '/basketball-hotboard/',
   plugins: [react()],
-  server: { port: 3000, open: true },
-  build: { outDir: 'dist', sourcemap: true }
+  // Remove the base: '/basketball-hotboard/' line for Vercel
 })
