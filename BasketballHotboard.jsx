@@ -872,6 +872,7 @@ export default function BasketballHotboard() {
   const [loading, setLoading] = useState(true);
   const [calculating, setCalculating] = useState(false);
   const [error, setError] = useState(null);
+  const [isMobile, setIsMobile] = useState(false);
   
   // UI state
   const [searchMode, setSearchMode] = useState('school');
@@ -885,6 +886,10 @@ export default function BasketballHotboard() {
   const [selectedCoach, setSelectedCoach] = useState(null);
   const [viewMode, setViewMode] = useState('overlaps');
   const [modalTab, setModalTab] = useState('career');
+  const [coachingTree, setCoachingTree] = useState(null);
+  const [statsView, setStatsView] = useState('offense'); // 'offense' or 'defense'
+  const [secondarySchool, setSecondarySchool] = useState('');
+  const [secondarySearchTerm, setSecondarySearchTerm] = useState('');
   
   // Connection data
   const [currentStaff, setCurrentStaff] = useState([]);
@@ -930,6 +935,14 @@ export default function BasketballHotboard() {
     }
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [stateDropdownOpen]);
+
+  // Detect mobile screen size
+  useEffect(() => {
+    const checkMobile = () => setIsMobile(window.innerWidth < 768);
+    checkMobile();
+    window.addEventListener('resize', checkMobile);
+    return () => window.removeEventListener('resize', checkMobile);
+  }, []);
 
   // Get all unique current teams
   const allCurrentTeams = useMemo(() => {
@@ -1219,11 +1232,64 @@ export default function BasketballHotboard() {
     setCalculating(false);
   }, [selectedSchool, coachesData]);
 
-  // Filtered connections
+  // Get all connected teams for secondary filter dropdown
+  const connectedTeams = useMemo(() => {
+    const teams = new Set();
+    connections.forEach(conn => {
+      if (conn.otherCoach.currentTeam && conn.otherCoach.currentTeam !== selectedSchool) {
+        teams.add(conn.otherCoach.currentTeam);
+      }
+    });
+    return teams;
+  }, [connections, selectedSchool]);
+
+  // List of connected teams for dropdown
+  const connectedTeamsList = useMemo(() => {
+    return Array.from(connectedTeams).sort();
+  }, [connectedTeams]);
+
+  // Filter secondary schools based on search
+  const filteredSecondarySchools = useMemo(() => {
+    if (!secondarySearchTerm) return [];
+    const term = secondarySearchTerm.toLowerCase();
+    return connectedTeamsList.filter(team => 
+      team.toLowerCase().includes(term)
+    );
+  }, [connectedTeamsList, secondarySearchTerm]);
+
+  // Filtered connections (by staff member and/or secondary school)
   const filteredConnections = useMemo(() => {
-    if (!selectedStaffMember) return connections;
-    return connections.filter(c => c.currentCoach.name === selectedStaffMember.name);
-  }, [connections, selectedStaffMember]);
+    let filtered = connections;
+    
+    if (selectedStaffMember) {
+      filtered = filtered.filter(c => c.currentCoach.name === selectedStaffMember.name);
+    }
+    
+    if (secondarySchool) {
+      filtered = filtered.filter(c => 
+        schoolsMatch(c.otherCoach.currentTeam, secondarySchool)
+      );
+    }
+    
+    return filtered;
+  }, [connections, selectedStaffMember, secondarySchool]);
+
+  // Unique other coaches (for stats display)
+  const uniqueOtherCoaches = useMemo(() => {
+    const coaches = new Set();
+    connections.forEach(conn => {
+      coaches.add(conn.otherCoach.name);
+    });
+    return coaches;
+  }, [connections]);
+
+  const filteredUniqueOtherCoaches = useMemo(() => {
+    const coaches = new Set();
+    filteredConnections.forEach(conn => {
+      coaches.add(conn.otherCoach.name);
+    });
+    return coaches;
+  }, [filteredConnections]);
 
   // Group connections by pair
   const groupedConnections = useMemo(() => {
@@ -1382,6 +1448,8 @@ export default function BasketballHotboard() {
     setStateDropdownOpen(false);
     setSearchedCoach(null);
     setSelectedStaffMember(null);
+    setSecondarySchool('');
+    setSecondarySearchTerm('');
   };
 
   // Handle coach click
@@ -1389,11 +1457,211 @@ export default function BasketballHotboard() {
     const fullCoach = coachesData.find(c => c.name === coach.name) || coach;
     setSelectedCoach(fullCoach);
     setModalTab('career');
+    // Build coaching tree
+    const tree = buildCoachingTree(fullCoach, coachesData);
+    setCoachingTree(tree);
+  };
+
+  // Build coaching tree for a selected coach
+  const buildCoachingTree = (coach, allCoachesData) => {
+    if (!coach || !allCoachesData.length) return null;
+    
+    const tree = {
+      coach: coach,
+      workedUnder: [], // Head coaches they worked under
+      mentored: [] // Coaches they mentored who are now HCs
+    };
+    
+    const fullCoachData = allCoachesData.find(c => c.name === coach.name) || coach;
+    
+    // For each job in their career, find the head coach at that school/team
+    fullCoachData.coaching_career?.forEach(job => {
+      const wasHeadCoach = isHeadCoachPosition(job.position);
+      
+      if (!wasHeadCoach) {
+        // Find head coaches at this school during this time
+        allCoachesData.forEach(otherCoach => {
+          if (otherCoach.name === fullCoachData.name) return;
+          
+          otherCoach.coaching_career?.forEach(otherJob => {
+            const isHeadCoach = isHeadCoachPosition(otherJob.position);
+            if (!isHeadCoach) return;
+            
+            // Check if same school
+            if (!schoolsMatch(job.school, otherJob.school)) return;
+            
+            // Check year overlap
+            const jobStart = job.years?.start || 0;
+            const jobEnd = job.years?.end || 2026;
+            const otherStart = otherJob.years?.start || 0;
+            const otherEnd = otherJob.years?.end || 2026;
+            
+            if (jobStart && otherStart) {
+              const overlapStart = Math.max(jobStart, otherStart);
+              const overlapEnd = Math.min(jobEnd, otherEnd);
+              
+              if (overlapStart <= overlapEnd) {
+                // Check if already added this coach
+                const existing = tree.workedUnder.find(
+                  w => w.coach.name === otherCoach.name
+                );
+                if (existing) {
+                  existing.stints.push({
+                    school: job.school,
+                    years: { start: overlapStart, end: overlapEnd },
+                    myPosition: job.position
+                  });
+                } else {
+                  tree.workedUnder.push({
+                    coach: otherCoach,
+                    stints: [{
+                      school: job.school,
+                      years: { start: overlapStart, end: overlapEnd },
+                      myPosition: job.position
+                    }]
+                  });
+                }
+              }
+            }
+          });
+        });
+      } else {
+        // They were a head coach - find assistants who are now HCs
+        allCoachesData.forEach(otherCoach => {
+          if (otherCoach.name === fullCoachData.name) return;
+          
+          // Only consider coaches who are CURRENTLY active head coaches
+          if (!isHeadCoachPosition(otherCoach.currentPosition)) return;
+          if (!otherCoach.currentTeam) return; // Skip former coaches
+          
+          let workedTogetherStints = [];
+          
+          otherCoach.coaching_career?.forEach(otherJob => {
+            // Check if they worked at the same school while selected coach was HC
+            if (schoolsMatch(job.school, otherJob.school)) {
+              const jobStart = job.years?.start || 0;
+              const jobEnd = job.years?.end || 2026;
+              const otherStart = otherJob.years?.start || 0;
+              const otherEnd = otherJob.years?.end || 2026;
+              
+              if (jobStart && otherStart) {
+                const overlapStart = Math.max(jobStart, otherStart);
+                const overlapEnd = Math.min(jobEnd, otherEnd);
+                
+                if (overlapStart <= overlapEnd) {
+                  // They worked together, and the other coach wasn't also HC at that time
+                  const otherWasHC = isHeadCoachPosition(otherJob.position);
+                  if (!otherWasHC) {
+                    workedTogetherStints.push({
+                      school: job.school,
+                      position: otherJob.position,
+                      years: { start: overlapStart, end: overlapEnd }
+                    });
+                  }
+                }
+              }
+            }
+          });
+          
+          // If they worked together under this coach, add them
+          if (workedTogetherStints.length > 0) {
+            const existing = tree.mentored.find(m => m.coach.name === otherCoach.name);
+            if (existing) {
+              workedTogetherStints.forEach(stint => {
+                const alreadyHas = existing.stints.find(s => 
+                  s.school === stint.school && s.years.start === stint.years.start
+                );
+                if (!alreadyHas) existing.stints.push(stint);
+              });
+            } else {
+              tree.mentored.push({
+                coach: otherCoach,
+                stints: workedTogetherStints,
+                currentHCJob: {
+                  school: otherCoach.currentTeam,
+                  position: otherCoach.currentPosition
+                }
+              });
+            }
+          }
+        });
+      }
+    });
+    
+    // Sort workedUnder by earliest stint year
+    tree.workedUnder.sort((a, b) => {
+      const aYear = Math.min(...a.stints.map(s => s.years.start));
+      const bYear = Math.min(...b.stints.map(s => s.years.start));
+      return aYear - bYear;
+    });
+    
+    // Sort mentored by when they started working together
+    tree.mentored.sort((a, b) => {
+      const aYear = Math.min(...a.stints.map(s => s.years.start));
+      const bYear = Math.min(...b.stints.map(s => s.years.start));
+      return aYear - bYear;
+    });
+    
+    // Filter workedUnder to only currently active HCs
+    tree.workedUnder = tree.workedUnder.filter(w => 
+      isHeadCoachPosition(w.coach.currentPosition) && w.coach.currentTeam
+    );
+    
+    return tree;
+  };
+  
+  // Get stats for a coach's tenures
+  const getCoachStats = (coach) => {
+    if (!coach || !torvikData?.data) return [];
+    
+    const stats = [];
+    const career = coach.coaching_career || [];
+    
+    // Get stats for ALL coaching stints (not just HC)
+    career.forEach(stint => {
+      const startYear = stint.years?.start;
+      const endYear = stint.years?.end || 2026;
+      
+      if (!startYear) return;
+      
+      // T-Rank year = when season ENDS (March)
+      // Career startYear = when coach STARTED (fall)
+      // So if coach started fall 2016, first T-Rank year is 2017 (2016-17 season)
+      const firstTorvikYear = startYear + 1;
+      const lastTorvikYear = endYear;
+      
+      for (let year = Math.max(firstTorvikYear, 2008); year <= Math.min(lastTorvikYear, 2026); year++) {
+        const yearData = torvikData.data[year.toString()];
+        if (!yearData?.teams) continue;
+        
+        // Find the team in this year's data
+        const teamData = yearData.teams.find(t => 
+          schoolsMatch(t.team, stint.school)
+        );
+        
+        if (teamData) {
+          // Check if we already have this year (could be at same school in different role)
+          const existing = stats.find(s => s.year === year && schoolsMatch(s.school, stint.school));
+          if (!existing) {
+            stats.push({
+              year,
+              school: stint.school,
+              position: stint.position,
+              isHC: isHeadCoachPosition(stint.position),
+              ...teamData
+            });
+          }
+        }
+      }
+    });
+    
+    return stats.sort((a, b) => b.year - a.year);
   };
 
   const closeModal = () => {
     setSelectedCoach(null);
     setModalTab('career');
+    setCoachingTree(null);
   };
 
   // Loading state
@@ -1483,10 +1751,13 @@ export default function BasketballHotboard() {
       }}>
         {/* Search Mode Toggle */}
         <div style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(2, 1fr)',
+          display: isMobile ? 'flex' : 'grid',
+          gridTemplateColumns: isMobile ? undefined : 'repeat(4, 1fr)',
+          overflowX: isMobile ? 'auto' : undefined,
           gap: '0.4rem',
-          marginBottom: '0.75rem'
+          marginBottom: '0.75rem',
+          paddingBottom: isMobile ? '0.5rem' : undefined,
+          WebkitOverflowScrolling: 'touch'
         }}>
           {[
             { id: 'school', label: 'By School', emoji: '🏀', color: '255,107,53', tooltip: 'Select a school to see coaching connections.' },
@@ -1502,22 +1773,23 @@ export default function BasketballHotboard() {
               onClick={() => handleSearchModeChange(mode.id)}
               title={mode.tooltip}
               style={{
-                padding: '0.55rem 0.5rem',
+                padding: isMobile ? '0.6rem 0.75rem' : '0.55rem 0.5rem',
                 background: searchMode === mode.id ? `rgba(${mode.color},0.3)` : 'rgba(255,255,255,0.05)',
                 border: searchMode === mode.id ? `1px solid rgba(${mode.color},0.5)` : '1px solid rgba(255,255,255,0.1)',
                 borderRadius: '6px',
                 color: searchMode === mode.id ? `rgb(${mode.color})` : '#8892b0',
                 cursor: 'pointer',
-                fontSize: '0.7rem',
+                fontSize: isMobile ? '0.65rem' : '0.7rem',
                 fontWeight: 600,
                 textTransform: 'uppercase',
                 letterSpacing: '0.03em',
                 transition: 'all 0.2s ease',
                 whiteSpace: 'nowrap',
-                textAlign: 'center'
+                textAlign: 'center',
+                flexShrink: 0
               }}
             >
-              {mode.emoji} {mode.label}
+              {mode.emoji} {isMobile ? mode.label.replace('By ', '') : mode.label}
             </button>
           ))}
         </div>
@@ -1525,7 +1797,7 @@ export default function BasketballHotboard() {
         {/* Section Description */}
         <p style={{
           color: '#8892b0',
-          fontSize: '0.8rem',
+          fontSize: isMobile ? '0.75rem' : '0.8rem',
           lineHeight: 1.6,
           margin: '0 0 1rem 0',
           padding: '0.6rem 0.8rem',
@@ -1583,7 +1855,7 @@ export default function BasketballHotboard() {
         )}
 
         {/* Search Input */}
-        {searchMode !== 'stats' && searchMode !== 'staffHistory' && searchMode !== 'schoolHistory' && searchMode !== 'region' && (
+        {searchMode !== 'stats' && searchMode !== 'staffHistory' && searchMode !== 'schoolHistory' && (
           <div>
             <label style={{
               display: 'block',
@@ -1635,6 +1907,8 @@ export default function BasketballHotboard() {
                       onClick={() => {
                         setSelectedSchool(school);
                         setSearchTerm('');
+                        setSecondarySchool('');
+                        setSecondarySearchTerm('');
                       }}
                       style={{
                         padding: '0.75rem 1rem',
@@ -1767,6 +2041,8 @@ export default function BasketballHotboard() {
               onClick={() => {
                 setSelectedSchool('');
                 setSelectedStaffMember(null);
+                setSecondarySchool('');
+                setSecondarySearchTerm('');
               }}
               style={{
                 background: 'rgba(255,255,255,0.1)',
@@ -1784,6 +2060,121 @@ export default function BasketballHotboard() {
             >
               ×
             </button>
+          </div>
+          
+          {/* Secondary School Filter - only show in All Connections view */}
+          {viewMode === 'overlaps' && connectedTeamsList.length > 0 && (
+            <>
+              <span style={{ color: '#8892b0', fontSize: '1.25rem' }}>→</span>
+              {secondarySchool ? (
+                <div style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '0.75rem',
+                  background: 'linear-gradient(135deg, rgba(96,165,250,0.2), rgba(96,165,250,0.1))',
+                  padding: '0.75rem 1.25rem',
+                  borderRadius: '100px',
+                  border: '1px solid rgba(96,165,250,0.4)'
+                }}>
+                  <TeamLogo team={secondarySchool} size={28} />
+                  <span style={{ fontWeight: 700, color: '#60a5fa' }}>{secondarySchool}</span>
+                  <button
+                    onClick={() => {
+                      setSecondarySchool('');
+                      setSecondarySearchTerm('');
+                    }}
+                    style={{
+                      background: 'rgba(255,255,255,0.1)',
+                      border: 'none',
+                      borderRadius: '50%',
+                      width: '24px',
+                      height: '24px',
+                      cursor: 'pointer',
+                      color: '#888',
+                      fontSize: '1rem',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center'
+                    }}
+                  >
+                    ×
+                  </button>
+                </div>
+              ) : (
+                <div style={{ position: 'relative' }}>
+                  <input
+                    type="text"
+                    value={secondarySearchTerm}
+                    onChange={(e) => setSecondarySearchTerm(e.target.value)}
+                    placeholder="Filter by connected school..."
+                    style={{
+                      padding: '0.5rem 1rem',
+                      background: 'rgba(255,255,255,0.03)',
+                      border: '1px solid rgba(96,165,250,0.3)',
+                      borderRadius: '100px',
+                      color: '#fff',
+                      fontSize: '0.85rem',
+                      outline: 'none',
+                      width: '220px',
+                      transition: 'all 0.3s ease'
+                    }}
+                    onFocus={(e) => e.target.style.borderColor = 'rgba(96,165,250,0.6)'}
+                    onBlur={(e) => {
+                      setTimeout(() => {
+                        e.target.style.borderColor = 'rgba(96,165,250,0.3)';
+                      }, 200);
+                    }}
+                  />
+                  {secondarySearchTerm && filteredSecondarySchools.length > 0 && (
+                    <div style={{
+                      position: 'absolute',
+                      top: '100%',
+                      left: 0,
+                      right: 0,
+                      background: '#1a1a2e',
+                      border: '1px solid rgba(96,165,250,0.3)',
+                      borderRadius: '8px',
+                      marginTop: '4px',
+                      maxHeight: '200px',
+                      overflowY: 'auto',
+                      zIndex: 100
+                    }}>
+                      {filteredSecondarySchools.slice(0, 10).map(school => (
+                        <div
+                          key={school}
+                          onClick={() => {
+                            setSecondarySchool(school);
+                            setSecondarySearchTerm('');
+                          }}
+                          style={{
+                            padding: '0.5rem 0.75rem',
+                            cursor: 'pointer',
+                            borderBottom: '1px solid rgba(255,255,255,0.05)',
+                            fontSize: '0.85rem',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '0.5rem',
+                            transition: 'background 0.2s ease'
+                          }}
+                          onMouseEnter={(e) => e.target.style.background = 'rgba(96,165,250,0.1)'}
+                          onMouseLeave={(e) => e.target.style.background = 'transparent'}
+                        >
+                          <TeamLogo team={school} size={16} />
+                          {school}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+          
+          {/* Stats line */}
+          <div style={{ color: '#8892b0', fontSize: '0.9rem' }}>
+            <span style={{ color: '#ff6b35', fontWeight: 700 }}>{selectedStaffMember ? '1' : currentStaff.length}</span> current staff · 
+            <span style={{ color: '#ff6b35', fontWeight: 700 }}> {secondarySchool || selectedStaffMember ? filteredUniqueOtherCoaches.size : uniqueOtherCoaches.size}</span> coaches connected ·
+            <span style={{ color: '#ff6b35', fontWeight: 700 }}> {secondarySchool ? '1' : connectedTeams.size}</span> other programs
           </div>
         </div>
       )}
@@ -1826,8 +2217,8 @@ export default function BasketballHotboard() {
 
           <div style={{
             display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))',
-            gap: '1rem'
+            gridTemplateColumns: `repeat(auto-fill, minmax(${isMobile ? '160px' : '280px'}, 1fr))`,
+            gap: isMobile ? '0.5rem' : '1rem'
           }}>
             {almaMaterCoaches.map((coach, idx) => (
               <div
@@ -2232,8 +2623,8 @@ export default function BasketballHotboard() {
               </div>
               <div style={{
                 display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))',
-                gap: '0.75rem'
+                gridTemplateColumns: `repeat(auto-fill, minmax(${isMobile ? '160px' : '300px'}, 1fr))`,
+                gap: isMobile ? '0.5rem' : '0.75rem'
               }}>
                 {coachesByState.map(coach => (
                   <div
@@ -2519,7 +2910,7 @@ export default function BasketballHotboard() {
                       </div>
                     </div>
                     
-                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '0.75rem' }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: `repeat(auto-fill, minmax(${isMobile ? '160px' : '280px'}, 1fr))`, gap: isMobile ? '0.5rem' : '0.75rem' }}>
                       {staffGroup.otherCoaches.map((oc, ocIdx) => (
                         <div
                           key={ocIdx}
@@ -2587,7 +2978,7 @@ export default function BasketballHotboard() {
             alignItems: 'center',
             justifyContent: 'center',
             zIndex: 1000,
-            padding: '2rem',
+            padding: isMobile ? '0.5rem' : '2rem',
             overflow: 'auto'
           }}
           onClick={closeModal}
@@ -2595,18 +2986,18 @@ export default function BasketballHotboard() {
           <div 
             style={{
               background: 'linear-gradient(135deg, #1a1a2e 0%, #16213e 100%)',
-              borderRadius: '16px',
+              borderRadius: isMobile ? '12px' : '16px',
               border: '1px solid rgba(255,107,53,0.3)',
               maxWidth: '900px',
               width: '100%',
-              maxHeight: '90vh',
+              maxHeight: isMobile ? '95vh' : '90vh',
               overflow: 'auto',
               position: 'relative'
             }}
             onClick={(e) => e.stopPropagation()}
           >
             <div style={{
-              padding: '1.5rem 2rem',
+              padding: isMobile ? '1rem' : '1.5rem 2rem',
               borderBottom: '1px solid rgba(255,255,255,0.1)',
               position: 'sticky',
               top: 0,
@@ -2634,7 +3025,7 @@ export default function BasketballHotboard() {
               >
                 ×
               </button>
-              <h2 style={{ fontSize: '1.75rem', fontWeight: 700, color: '#fff', marginBottom: '0.25rem' }}>
+              <h2 style={{ fontSize: isMobile ? '1.25rem' : '1.75rem', fontWeight: 700, color: '#fff', marginBottom: '0.25rem', paddingRight: '2.5rem' }}>
                 {selectedCoach.name}
                 {(() => {
                   const ageInfo = getCoachAge(selectedCoach);
@@ -2649,96 +3040,429 @@ export default function BasketballHotboard() {
                 <TeamLogo team={selectedCoach.currentTeam} size={22} />
                 {selectedCoach.currentPosition} @ {selectedCoach.currentTeam}
               </div>
-            </div>
-
-            <div style={{ padding: '1.5rem 2rem' }}>
-              {/* Bio */}
+              
+              {/* Bio Info */}
               <div style={{
                 display: 'flex',
                 flexWrap: 'wrap',
-                gap: '1.5rem',
-                marginBottom: '1.5rem',
-                paddingBottom: '1.5rem',
-                borderBottom: '1px solid rgba(255,255,255,0.1)'
+                gap: '1rem',
+                marginTop: '0.75rem',
+                fontSize: '0.85rem'
               }}>
                 {selectedCoach.birthDate && (
-                  <div style={{ fontSize: '0.9rem' }}>
-                    <span style={{ color: '#8892b0' }}>🎂 Born: </span>
+                  <div>
+                    <span style={{ color: '#8892b0' }}>🎂 </span>
                     <span style={{ color: '#ccd6f6' }}>{formatBirthdate(selectedCoach.birthDate)}</span>
                   </div>
                 )}
                 {(selectedCoach.birthPlace || selectedCoach.birthplace) && (
-                  <div style={{ fontSize: '0.9rem' }}>
-                    <span style={{ color: '#8892b0' }}>📍 From: </span>
+                  <div>
+                    <span style={{ color: '#8892b0' }}>📍 </span>
                     <span style={{ color: '#ccd6f6' }}>{selectedCoach.birthPlace || selectedCoach.birthplace}</span>
                   </div>
                 )}
                 {(selectedCoach.almaMater || selectedCoach.alma_mater) && (
-                  <div style={{ fontSize: '0.9rem' }}>
-                    <span style={{ color: '#8892b0' }}>🎓 Played at: </span>
+                  <div>
+                    <span style={{ color: '#8892b0' }}>🎓 </span>
                     <span style={{ color: '#ccd6f6' }}>{formatAlmaMater(selectedCoach.almaMater || selectedCoach.alma_mater)}</span>
                   </div>
                 )}
-                {selectedCoach.overallRecord && formatOverallRecord(selectedCoach.overallRecord) && (
-                  <div style={{ fontSize: '0.9rem' }}>
-                    <span style={{ color: '#8892b0' }}>📊 Record: </span>
-                    <span style={{ color: '#ccd6f6' }}>{formatOverallRecord(selectedCoach.overallRecord)}</span>
-                  </div>
-                )}
               </div>
+            </div>
+            
+            {/* Modal Tabs */}
+            <div style={{
+              display: 'flex',
+              gap: '0.5rem',
+              padding: '0 2rem',
+              borderBottom: '1px solid rgba(255,255,255,0.1)'
+            }}>
+              <button
+                onClick={() => setModalTab('career')}
+                style={{
+                  padding: '0.75rem 1.5rem',
+                  background: 'transparent',
+                  border: 'none',
+                  borderBottom: modalTab === 'career' ? '2px solid #ff6b35' : '2px solid transparent',
+                  color: modalTab === 'career' ? '#ff6b35' : '#8892b0',
+                  cursor: 'pointer',
+                  fontSize: '0.85rem',
+                  fontWeight: 600,
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.05em'
+                }}
+              >
+                📋 Career
+              </button>
+              <button
+                onClick={() => setModalTab('tree')}
+                style={{
+                  padding: '0.75rem 1.5rem',
+                  background: 'transparent',
+                  border: 'none',
+                  borderBottom: modalTab === 'tree' ? '2px solid #4ade80' : '2px solid transparent',
+                  color: modalTab === 'tree' ? '#4ade80' : '#8892b0',
+                  cursor: 'pointer',
+                  fontSize: '0.85rem',
+                  fontWeight: 600,
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.05em'
+                }}
+              >
+                🌳 Tree
+              </button>
+              <button
+                onClick={() => setModalTab('stats')}
+                style={{
+                  padding: '0.75rem 1.5rem',
+                  background: 'transparent',
+                  border: 'none',
+                  borderBottom: modalTab === 'stats' ? '2px solid #60a5fa' : '2px solid transparent',
+                  color: modalTab === 'stats' ? '#60a5fa' : '#8892b0',
+                  cursor: 'pointer',
+                  fontSize: '0.85rem',
+                  fontWeight: 600,
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.05em'
+                }}
+              >
+                📊 Stats
+              </button>
+            </div>
 
-              {/* Career */}
-              <h3 style={{
-                fontSize: '0.9rem',
-                fontWeight: 700,
-                color: '#ff6b35',
-                marginBottom: '1rem',
-                textTransform: 'uppercase',
-                letterSpacing: '0.1em'
-              }}>
-                Full Coaching Career
-              </h3>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                {sortCareerByYear(selectedCoach.coaching_career, selectedCoach.currentTeam)?.map((job, idx) => {
-                  const isHC = isHeadCoachPosition(job.position);
-                  return (
-                    <div
-                      key={idx}
-                      style={{
+            <div style={{ padding: '1.5rem 2rem' }}>
+              {/* Career Tab */}
+              {modalTab === 'career' && (
+                <div>
+                  <h3 style={{
+                    fontSize: '1rem',
+                    fontWeight: 700,
+                    color: '#ff6b35',
+                    marginBottom: '1rem',
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.1em'
+                  }}>
+                    📋 Coaching History
+                  </h3>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                    {sortCareerByYear(selectedCoach.coaching_career, selectedCoach.currentTeam)?.map((job, idx) => {
+                      const isHC = isHeadCoachPosition(job.position);
+                      return (
+                        <div
+                          key={idx}
+                          style={{
+                            display: 'grid',
+                            gridTemplateColumns: '100px 1fr',
+                            gap: '1rem',
+                            padding: '0.75rem 1rem',
+                            background: isHC ? 'rgba(255,107,53,0.15)' : 'rgba(255,255,255,0.03)',
+                            borderRadius: '8px',
+                            borderLeft: isHC ? '3px solid #ff6b35' : '3px solid transparent'
+                          }}
+                        >
+                          <div style={{ color: '#8892b0', fontSize: '0.85rem', fontWeight: 600 }}>
+                            {formatYearRange(job.years?.start, job.years?.end, job.raw_years) || '—'}
+                          </div>
+                          <div>
+                            <div style={{ color: '#fff', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                              <TeamLogo team={normalizeSchoolForDisplay(job.school)} size={18} />
+                              {normalizeSchoolForDisplay(job.school)}
+                            </div>
+                            <div style={{ color: '#8892b0', fontSize: '0.85rem' }}>
+                              {job.position}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  
+                  {selectedCoach.url && (
+                    <div style={{ marginTop: '1.5rem', textAlign: 'center' }}>
+                      <a
+                        href={selectedCoach.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        style={{ color: '#8892b0', fontSize: '0.85rem', textDecoration: 'none' }}
+                      >
+                        View on Wikipedia →
+                      </a>
+                    </div>
+                  )}
+                </div>
+              )}
+              
+              {/* Tree Tab */}
+              {modalTab === 'tree' && coachingTree && (
+                <>
+                  {/* Worked Under Section */}
+                  {coachingTree.workedUnder.length > 0 && (
+                    <div style={{ marginBottom: '2rem' }}>
+                      <h3 style={{
+                        fontSize: '0.9rem',
+                        fontWeight: 700,
+                        color: '#60a5fa',
+                        marginBottom: '1rem',
+                        textTransform: 'uppercase',
+                        letterSpacing: '0.05em'
+                      }}>
+                        Active Head Coaches Worked Under ({coachingTree.workedUnder.length})
+                      </h3>
+                      <div style={{
                         display: 'grid',
-                        gridTemplateColumns: '90px 1fr',
-                        gap: '1rem',
-                        padding: '0.75rem 1rem',
-                        background: isHC ? 'rgba(255,107,53,0.1)' : 'rgba(255,255,255,0.03)',
-                        borderRadius: '8px',
-                        borderLeft: isHC ? '3px solid #ff6b35' : '3px solid transparent'
-                      }}
-                    >
-                      <div style={{ color: '#fbbf24', fontSize: '0.85rem', fontFamily: 'monospace', fontWeight: 600 }}>
-                        {formatYearRange(job.years?.start, job.years?.end, job.raw_years) || '—'}
-                      </div>
-                      <div>
-                        <span style={{ color: '#fff', fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
-                          <TeamLogo team={normalizeSchoolForDisplay(job.school)} size={18} />
-                          {normalizeSchoolForDisplay(job.school)}
-                        </span>
-                        <span style={{ color: '#8892b0' }}> — {job.position}</span>
+                        gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))',
+                        gap: '1rem'
+                      }}>
+                        {coachingTree.workedUnder.map((item, idx) => (
+                          <div
+                            key={idx}
+                            style={{
+                              background: 'rgba(96,165,250,0.1)',
+                              borderRadius: '8px',
+                              padding: '1rem',
+                              border: '1px solid rgba(96,165,250,0.2)',
+                              cursor: 'pointer'
+                            }}
+                            onClick={() => handleCoachClick(item.coach)}
+                          >
+                            <div style={{ fontWeight: 600, color: '#fff', marginBottom: '0.25rem' }}>
+                              {item.coach.name}
+                            </div>
+                            <div style={{ color: '#4ade80', fontSize: '0.85rem', marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                              Now: Head coach @ <TeamLogo team={item.coach.currentTeam} size={14} /> {item.coach.currentTeam}
+                            </div>
+                            {item.stints.map((stint, sIdx) => (
+                              <div key={sIdx} style={{
+                                fontSize: '0.8rem',
+                                color: '#8892b0',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '0.3rem',
+                                marginTop: '0.25rem'
+                              }}>
+                                <TeamLogo team={stint.school} size={12} />
+                                {stint.school} ({stint.years.start}-{stint.years.end})
+                                <span style={{ color: '#666' }}>• Their role: {stint.myPosition}</span>
+                              </div>
+                            ))}
+                          </div>
+                        ))}
                       </div>
                     </div>
-                  );
-                })}
-              </div>
-
-              {selectedCoach.url && (
-                <div style={{ marginTop: '1.5rem', textAlign: 'center' }}>
-                  <a
-                    href={selectedCoach.url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    style={{ color: '#8892b0', fontSize: '0.9rem', textDecoration: 'none' }}
-                  >
-                    View on Wikipedia →
-                  </a>
+                  )}
+                  
+                  {/* Mentored Section */}
+                  {coachingTree.mentored.length > 0 && (
+                    <div>
+                      <h3 style={{
+                        fontSize: '0.9rem',
+                        fontWeight: 700,
+                        color: '#4ade80',
+                        marginBottom: '1rem',
+                        textTransform: 'uppercase',
+                        letterSpacing: '0.05em'
+                      }}>
+                        Active HC Tree ({coachingTree.mentored.length})
+                      </h3>
+                      <div style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))',
+                        gap: '1rem'
+                      }}>
+                        {coachingTree.mentored.map((item, idx) => (
+                          <div
+                            key={idx}
+                            style={{
+                              background: 'rgba(74,222,128,0.1)',
+                              borderRadius: '8px',
+                              padding: '1rem',
+                              border: '1px solid rgba(74,222,128,0.2)',
+                              cursor: 'pointer'
+                            }}
+                            onClick={() => handleCoachClick(item.coach)}
+                          >
+                            <div style={{ fontWeight: 600, color: '#fff', marginBottom: '0.25rem' }}>
+                              {item.coach.name}
+                            </div>
+                            <div style={{ color: '#4ade80', fontSize: '0.85rem', marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                              Now: Head coach @ <TeamLogo team={item.coach.currentTeam} size={14} /> {item.coach.currentTeam}
+                            </div>
+                            {item.stints.map((stint, sIdx) => (
+                              <div key={sIdx} style={{
+                                fontSize: '0.8rem',
+                                color: '#8892b0',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '0.3rem',
+                                marginTop: '0.25rem'
+                              }}>
+                                <TeamLogo team={stint.school} size={12} />
+                                {stint.school} ({stint.years.start}-{stint.years.end})
+                                <span style={{ color: '#666' }}>• Their role: {stint.position}</span>
+                              </div>
+                            ))}
+                            </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  
+                  {coachingTree.workedUnder.length === 0 && coachingTree.mentored.length === 0 && (
+                    <div style={{
+                      textAlign: 'center',
+                      padding: '3rem',
+                      color: '#8892b0'
+                    }}>
+                      <div style={{ fontSize: '2rem', marginBottom: '1rem', opacity: 0.5 }}>🌳</div>
+                      <p>No active coaching tree connections found.</p>
+                      <p style={{ fontSize: '0.85rem', marginTop: '0.5rem' }}>
+                        This coach may not have worked under or mentored any currently active head coaches.
+                      </p>
+                    </div>
+                  )}
+                </>
+              )}
+              
+              {modalTab === 'tree' && !coachingTree && (
+                <div style={{ textAlign: 'center', padding: '2rem', color: '#8892b0' }}>
+                  Loading coaching tree...
+                </div>
+              )}
+              
+              {/* Stats Tab */}
+              {modalTab === 'stats' && (
+                <div>
+                  <h3 style={{
+                    fontSize: '1rem',
+                    fontWeight: 700,
+                    color: '#60a5fa',
+                    marginBottom: '0.5rem',
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.1em'
+                  }}>
+                    📊 Performance Stats
+                  </h3>
+                  <p style={{ color: '#8892b0', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
+                    Team performance during coaching tenures. Data from barttorvik.com (2008-2026).
+                  </p>
+                  
+                  {(() => {
+                    const coachStats = getCoachStats(selectedCoach);
+                    
+                    if (coachStats.length === 0) {
+                      return (
+                        <div style={{ textAlign: 'center', padding: '2rem', color: '#8892b0' }}>
+                          No T-Rank stats available for this coach's tenures (2008-2026).
+                        </div>
+                      );
+                    }
+                    
+                    const getRankColor = (rank, total = 364) => {
+                      if (!rank) return '#555';
+                      const pct = rank / total;
+                      if (pct <= 0.1) return '#4ade80';  // Top 10%
+                      if (pct <= 0.25) return '#a3e635'; // Top 25%
+                      if (pct <= 0.5) return '#fbbf24';  // Top 50%
+                      if (pct <= 0.75) return '#fb923c'; // Top 75%
+                      return '#f87171';  // Bottom 25%
+                    };
+                    
+                    const formatStat = (val, decimals = 1) => {
+                      if (val === undefined || val === null) return '—';
+                      return typeof val === 'number' ? val.toFixed(decimals) : val;
+                    };
+                    
+                    return (
+                      <div style={{ overflowX: 'auto' }}>
+                        <table style={{
+                          width: '100%',
+                          borderCollapse: 'collapse',
+                          fontSize: '0.8rem',
+                          minWidth: '900px'
+                        }}>
+                          <thead>
+                            <tr style={{ background: 'rgba(96,165,250,0.15)' }}>
+                              <th style={{ padding: '0.6rem 0.5rem', textAlign: 'left', color: '#8892b0', fontWeight: 600, position: 'sticky', left: 0, background: '#1a1f35', zIndex: 1 }}>Year</th>
+                              <th style={{ padding: '0.6rem 0.5rem', textAlign: 'left', color: '#8892b0', fontWeight: 600 }}>School</th>
+                              <th style={{ padding: '0.6rem 0.5rem', textAlign: 'left', color: '#8892b0', fontWeight: 600 }}>Role</th>
+                              <th style={{ padding: '0.6rem 0.5rem', textAlign: 'center', color: '#8892b0', fontWeight: 600 }}>Rank</th>
+                              <th style={{ padding: '0.6rem 0.5rem', textAlign: 'center', color: '#8892b0', fontWeight: 600 }}>Record</th>
+                              <th style={{ padding: '0.6rem 0.5rem', textAlign: 'center', color: '#8892b0', fontWeight: 600 }}>AdjOE</th>
+                              <th style={{ padding: '0.6rem 0.5rem', textAlign: 'center', color: '#8892b0', fontWeight: 600 }}>AdjDE</th>
+                              <th style={{ padding: '0.6rem 0.5rem', textAlign: 'center', color: '#8892b0', fontWeight: 600 }}>Tempo</th>
+                              <th style={{ padding: '0.6rem 0.5rem', textAlign: 'center', color: '#8892b0', fontWeight: 600 }}>eFG%</th>
+                              <th style={{ padding: '0.6rem 0.5rem', textAlign: 'center', color: '#8892b0', fontWeight: 600 }}>TO%</th>
+                              <th style={{ padding: '0.6rem 0.5rem', textAlign: 'center', color: '#8892b0', fontWeight: 600 }}>ORB%</th>
+                              <th style={{ padding: '0.6rem 0.5rem', textAlign: 'center', color: '#8892b0', fontWeight: 600 }}>FTR</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {coachStats.map((stat, idx) => (
+                              <tr 
+                                key={idx}
+                                style={{ 
+                                  background: stat.isHC 
+                                    ? 'rgba(255,107,53,0.1)' 
+                                    : (idx % 2 === 0 ? 'rgba(255,255,255,0.02)' : 'transparent'),
+                                  borderBottom: '1px solid rgba(255,255,255,0.05)',
+                                  borderLeft: stat.isHC ? '3px solid #ff6b35' : '3px solid transparent'
+                                }}
+                              >
+                                <td style={{ padding: '0.5rem', color: '#fbbf24', fontWeight: 600, position: 'sticky', left: 0, background: stat.isHC ? 'rgba(30,34,53,0.95)' : (idx % 2 === 0 ? '#1e2235' : '#1a1f35'), zIndex: 1 }}>
+                                  {stat.year}
+                                </td>
+                                <td style={{ padding: '0.5rem', color: '#fff' }}>
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                                    <TeamLogo team={stat.school} size={16} />
+                                    {normalizeSchoolForDisplay(stat.school)}
+                                  </div>
+                                </td>
+                                <td style={{ padding: '0.5rem' }}>
+                                  <span style={{
+                                    padding: '0.15rem 0.4rem',
+                                    borderRadius: '3px',
+                                    fontSize: '0.7rem',
+                                    fontWeight: 600,
+                                    background: stat.isHC ? 'rgba(255,107,53,0.3)' : 'rgba(136,146,176,0.2)',
+                                    color: stat.isHC ? '#ff6b35' : '#8892b0'
+                                  }}>
+                                    {stat.isHC ? 'HC' : 'ASST'}
+                                  </span>
+                                </td>
+                                <td style={{ padding: '0.5rem', textAlign: 'center', color: getRankColor(stat.rank), fontWeight: 600 }}>
+                                  #{stat.rank}
+                                </td>
+                                <td style={{ padding: '0.5rem', textAlign: 'center', color: '#ccd6f6' }}>
+                                  {stat.record}
+                                </td>
+                                <td style={{ padding: '0.5rem', textAlign: 'center', color: '#ccd6f6' }}>
+                                  {formatStat(stat.adj_oe)}
+                                </td>
+                                <td style={{ padding: '0.5rem', textAlign: 'center', color: '#ccd6f6' }}>
+                                  {formatStat(stat.adj_de)}
+                                </td>
+                                <td style={{ padding: '0.5rem', textAlign: 'center', color: '#ccd6f6' }}>
+                                  {formatStat(stat.adj_tempo)}
+                                </td>
+                                <td style={{ padding: '0.5rem', textAlign: 'center', color: '#ccd6f6' }}>
+                                  {formatStat(stat.efg_pct)}
+                                </td>
+                                <td style={{ padding: '0.5rem', textAlign: 'center', color: '#ccd6f6' }}>
+                                  {formatStat(stat.tor)}
+                                </td>
+                                <td style={{ padding: '0.5rem', textAlign: 'center', color: '#ccd6f6' }}>
+                                  {formatStat(stat.orb)}
+                                </td>
+                                <td style={{ padding: '0.5rem', textAlign: 'center', color: '#ccd6f6' }}>
+                                  {formatStat(stat.ftr)}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    );
+                  })()}
                 </div>
               )}
             </div>
