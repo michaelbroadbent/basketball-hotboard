@@ -308,7 +308,7 @@ export default function BasketballByStats({ coachesData, torvikData, onCoachClic
         if (!schoolsMatch(job.school, teamName)) continue;
         const s = job.years?.start;
         const e = job.years?.end ?? 2026;
-        if (s && year >= s && year <= e) {
+        if (s && year > s && year <= e) {
           results.push({ coach, jobPosition: job.position });
           break; // count each coach once per team
         }
